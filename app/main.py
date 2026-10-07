@@ -30,25 +30,42 @@ class ProcessingWorker(QObject):
     log = Signal(str)
     finished = Signal(str)
     error = Signal(str)
+    model_status = Signal(str)
 
     def __init__(self, video_path: str, model_name: str, output_dir: str):
         super().__init__()
         self.video_path = video_path
         self.model_name = model_name
         self.output_dir = output_dir
+        self.cancel_requested = False
+        self.pipeline = None
+
+    def request_cancel(self):
+        """Request cancellation of processing."""
+        self.cancel_requested = True
+        if self.pipeline is not None:
+            self.pipeline.request_cancel()
 
     def run(self):
         """Execute the video processing pipeline."""
         try:
-            pipeline = VideoEditPipeline(
+            self.pipeline = VideoEditPipeline(
                 output_dir=self.output_dir,
                 progress_callback=lambda value, text: self.progress.emit(value, text),
                 log_callback=lambda msg: self.log.emit(msg),
+                model_status_callback=lambda status: self.model_status.emit(status),
+                cancel_callback=lambda: self.cancel_requested,
             )
-            result = pipeline.process(self.video_path, model_name=self.model_name)
-            self.finished.emit(result)
+            result = self.pipeline.process(self.video_path, model_name=self.model_name)
+            if result:
+                self.finished.emit(result)
+            else:
+                self.error.emit("Processing was cancelled.")
         except Exception as exc:
-            self.error.emit(str(exc))
+            if not self.cancel_requested:
+                self.error.emit(str(exc))
+            else:
+                self.error.emit("Processing was cancelled.")
 
 
 class MainWindow(QMainWindow):
@@ -57,7 +74,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Kartik Auto Editor 🚀")
-        self.resize(1000, 750)
+        self.resize(1000, 850)
 
         # Dark modern theme
         self.setStyleSheet(
@@ -89,6 +106,7 @@ class MainWindow(QMainWindow):
         self.output_dir = str(Path.cwd() / "exports")
         self.thread = None
         self.worker = None
+        self.processing = False
 
         self._setup_ui()
 
@@ -140,22 +158,63 @@ class MainWindow(QMainWindow):
         self.model_combo.setMaximumWidth(150)
         form.addRow("Whisper model:", self.model_combo)
 
-        # Output folder
+        # Output folder selection
         self.output_label = QLabel(self.output_dir)
         self.output_label.setStyleSheet(
             "background: #161b22; padding: 12px; border: 1px solid #30363d; border-radius: 6px; color: #8b949e;"
         )
         self.output_label.setWordWrap(True)
-        form.addRow("Output folder:", self.output_label)
+        self.output_button = QPushButton("Choose Folder")
+        self.output_button.clicked.connect(self.select_output_folder)
+        self.output_button.setMaximumWidth(120)
+
+        output_row = QWidget()
+        output_row_layout = QHBoxLayout(output_row)
+        output_row_layout.setContentsMargins(0, 0, 0, 0)
+        output_row_layout.setSpacing(8)
+        output_row_layout.addWidget(self.output_label)
+        output_row_layout.addWidget(self.output_button)
+        form.addRow("Output folder:", output_row)
 
         layout.addLayout(form)
 
+        # Model status indicator
+        self.model_status_label = QLabel("Model: Ready")
+        self.model_status_label.setStyleSheet("color: #58a6ff; font-weight: 600; font-size: 11px;")
+        layout.addWidget(self.model_status_label)
+
+        # Control buttons row
+        controls_row = QWidget()
+        controls_layout = QHBoxLayout(controls_row)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+        controls_layout.setSpacing(8)
+
         # Start button
-        self.start_button = QPushButton("Start processing")
+        self.start_button = QPushButton("Start Processing")
         self.start_button.setMinimumHeight(44)
         self.start_button.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
         self.start_button.clicked.connect(self.start_processing)
-        layout.addWidget(self.start_button)
+        controls_layout.addWidget(self.start_button)
+
+        # Cancel button (initially disabled)
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.setMinimumHeight(44)
+        self.cancel_button.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
+        self.cancel_button.clicked.connect(self.cancel_processing)
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.setStyleSheet(
+            """
+            QPushButton {
+                background: #da3633; color: white; border: none; border-radius: 6px;
+                font-weight: 600; padding: 10px 16px; font-size: 12px;
+            }
+            QPushButton:hover { background: #f85149; }
+            QPushButton:disabled { background: #30363d; color: #6e7681; }
+            """
+        )
+        controls_layout.addWidget(self.cancel_button)
+
+        layout.addWidget(controls_row)
 
         # Progress bar
         self.progress_bar = QProgressBar()
@@ -172,9 +231,23 @@ class MainWindow(QMainWindow):
         # Log box
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
-        self.log_box.setMinimumHeight(300)
+        self.log_box.setMinimumHeight(280)
         self.log_box.setPlainText("Kartik Auto Editor v1.0.0\n" + "="*50 + "\n\nWaiting for input...\n")
         layout.addWidget(self.log_box)
+
+        # Log control buttons
+        log_controls = QWidget()
+        log_controls_layout = QHBoxLayout(log_controls)
+        log_controls_layout.setContentsMargins(0, 0, 0, 0)
+        log_controls_layout.setSpacing(8)
+
+        self.clear_log_button = QPushButton("Clear Log")
+        self.clear_log_button.clicked.connect(self.clear_log)
+        self.clear_log_button.setMaximumWidth(120)
+        log_controls_layout.addWidget(self.clear_log_button)
+        log_controls_layout.addStretch()
+
+        layout.addWidget(log_controls)
 
     def select_video(self):
         """Open file dialog to select a video."""
@@ -196,6 +269,29 @@ class MainWindow(QMainWindow):
         self.status_label.setText(f"Selected: {filename}")
         self.log_box.append(f"[INFO] Selected video: {path}")
 
+    def select_output_folder(self):
+        """Open folder dialog to select output directory."""
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Select output folder",
+            self.output_dir,
+            QFileDialog.Option.ShowDirsOnly,
+        )
+        if not folder:
+            return
+
+        self.output_dir = folder
+        self.output_label.setText(folder)
+        self.output_label.setStyleSheet(
+            "background: #161b22; padding: 12px; border: 1px solid #30363d; border-radius: 6px; color: #c9d1d9;"
+        )
+        self.log_box.append(f"[INFO] Output folder set to: {folder}")
+
+    def clear_log(self):
+        """Clear the log text box."""
+        self.log_box.clear()
+        self.log_box.append("Log cleared at " + str(Path.cwd()) + "\n")
+
     def start_processing(self):
         """Start the video processing pipeline."""
         if not self.video_path:
@@ -210,27 +306,44 @@ class MainWindow(QMainWindow):
 
         model_name = self.model_combo.currentText().strip().lower()
         self.start_button.setEnabled(False)
+        self.cancel_button.setEnabled(True)
         self.model_combo.setEnabled(False)
         self.video_button.setEnabled(False)
+        self.output_button.setEnabled(False)
         self.progress_bar.setValue(0)
         self.status_label.setText("Initializing...")
         self.log_box.append(f"\n[START] Processing with model: {model_name}\n")
+        self.processing = True
 
         self.thread = QThread()
         self.worker = ProcessingWorker(self.video_path, model_name, self.output_dir)
         self.worker.moveToThread(self.thread)
         self.worker.progress.connect(self.update_progress)
         self.worker.log.connect(self.append_log)
+        self.worker.model_status.connect(self.update_model_status)
         self.worker.finished.connect(self.processing_finished)
         self.worker.error.connect(self.processing_failed)
         self.thread.started.connect(self.worker.run)
         self.thread.start()
+
+    def cancel_processing(self):
+        """Cancel the currently running processing job."""
+        if self.worker is not None:
+            self.worker.request_cancel()
+            self.cancel_button.setEnabled(False)
+            self.status_label.setText("Cancelling...")
+            self.log_box.append("\n[INFO] Cancellation requested. Please wait...\n")
 
     def update_progress(self, value: int, text: str):
         """Update progress bar and status."""
         self.progress_bar.setValue(value)
         if text:
             self.status_label.setText(text)
+
+    def update_model_status(self, status: str):
+        """Update model download/loading status."""
+        self.model_status_label.setText(f"Model: {status}")
+        self.log_box.append(f"[MODEL] {status}")
 
     def append_log(self, message: str):
         """Append message to log box."""
@@ -243,8 +356,11 @@ class MainWindow(QMainWindow):
             self.thread.wait()
 
         self.start_button.setEnabled(True)
+        self.cancel_button.setEnabled(False)
         self.model_combo.setEnabled(True)
         self.video_button.setEnabled(True)
+        self.output_button.setEnabled(True)
+        self.processing = False
         self.status_label.setText("✓ Completed")
         self.log_box.append(f"\n[SUCCESS] Video exported to:\n{result}\n")
 
@@ -261,8 +377,11 @@ class MainWindow(QMainWindow):
             self.thread.wait()
 
         self.start_button.setEnabled(True)
+        self.cancel_button.setEnabled(False)
         self.model_combo.setEnabled(True)
         self.video_button.setEnabled(True)
+        self.output_button.setEnabled(True)
+        self.processing = False
         self.status_label.setText("✗ Error")
         self.log_box.append(f"\n[ERROR] {error_message}\n")
 

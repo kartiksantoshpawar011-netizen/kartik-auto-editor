@@ -22,12 +22,16 @@ class VideoEditPipeline:
         output_dir: str,
         progress_callback: Optional[Callable[[int, str], None]] = None,
         log_callback: Optional[Callable[[str], None]] = None,
+        model_status_callback: Optional[Callable[[str], None]] = None,
+        cancel_callback: Optional[Callable[[], bool]] = None,
     ):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self.progress_callback = progress_callback or (lambda *_: None)
         self.log_callback = log_callback or (lambda *_: None)
+        self.model_status_callback = model_status_callback or (lambda *_: None)
+        self.cancel_callback = cancel_callback or (lambda: False)
 
         # Get FFmpeg from imageio-ffmpeg package
         self.ffmpeg_path = Path(get_ffmpeg_exe())
@@ -45,24 +49,55 @@ class VideoEditPipeline:
         self.work_dir = Path.cwd() / "work"
         self.work_dir.mkdir(parents=True, exist_ok=True)
 
+        self.ffmpeg_process = None
+
     def emit_progress(self, value: int, text: str):
         """Emit progress update."""
+        if self.cancel_callback():
+            raise RuntimeError("Processing cancelled by user.")
         self.progress_callback(value, text)
         if text:
             self.log_callback(f"[{value}%] {text}")
 
+    def request_cancel(self):
+        """Request cancellation and terminate FFmpeg if running."""
+        if self.ffmpeg_process is not None:
+            try:
+                self.ffmpeg_process.terminate()
+                self.ffmpeg_process.wait(timeout=5)
+            except Exception:
+                try:
+                    self.ffmpeg_process.kill()
+                except Exception:
+                    pass
+
     def run_ffmpeg(self, command: List[str], description: str) -> subprocess.CompletedProcess:
         """Run FFmpeg command and handle errors."""
         try:
-            result = subprocess.run(command, capture_output=True, text=True, check=False)
-            if result.returncode != 0:
-                error_msg = result.stderr.strip() or result.stdout.strip() or "Unknown FFmpeg error"
+            self.ffmpeg_process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            stdout, stderr = self.ffmpeg_process.communicate()
+            
+            if self.ffmpeg_process.returncode != 0:
+                error_msg = stderr.strip() or stdout.strip() or "Unknown FFmpeg error"
                 raise RuntimeError(f"{description} failed:\n{error_msg}")
-            return result
+            
+            return subprocess.CompletedProcess(
+                args=command,
+                returncode=0,
+                stdout=stdout,
+                stderr=stderr,
+            )
         except FileNotFoundError as exc:
             raise RuntimeError(
                 f"FFmpeg not found. Ensure imageio-ffmpeg is installed correctly.\nDetails: {exc}"
             ) from exc
+        finally:
+            self.ffmpeg_process = None
 
     def extract_audio(self, source_video: str, output_audio: str):
         """Extract mono 16kHz audio from video."""
@@ -130,6 +165,8 @@ class VideoEditPipeline:
                 str(audio_path),
                 model_name=model_name,
                 model_dir=str(self.model_dir),
+                model_status_callback=self.model_status_callback,
+                cancel_callback=self.cancel_callback,
             )
             if not transcript:
                 raise RuntimeError(
@@ -208,4 +245,11 @@ class VideoEditPipeline:
             self.emit_progress(0, "✗ Error")
             error_msg = str(exc)
             self.log_callback(f"\n✗ ERROR: {error_msg}")
+            # Cleanup on error
+            for f in [audio_path, ass_path, edited_video]:
+                if f.exists():
+                    try:
+                        f.unlink()
+                    except Exception:
+                        pass
             raise

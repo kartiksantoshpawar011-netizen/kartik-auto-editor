@@ -1,7 +1,7 @@
 """Audio transcription with faster-whisper."""
 import os
 import re
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from faster_whisper import WhisperModel
 
@@ -51,6 +51,8 @@ def transcribe_audio(
     audio_path: str,
     model_name: str = "base",
     model_dir: str = "models",
+    model_status_callback: Optional[Callable[[str], None]] = None,
+    cancel_callback: Optional[Callable[[], bool]] = None,
 ) -> List[TranscriptSegment]:
     """Transcribe audio file using faster-whisper.
 
@@ -58,6 +60,8 @@ def transcribe_audio(
         audio_path: Path to audio file (WAV, MP3, etc.)
         model_name: Whisper model size: 'tiny', 'base', 'small'
         model_dir: Directory to cache downloaded models
+        model_status_callback: Optional callback for model status updates
+        cancel_callback: Optional callback to check for cancellation
 
     Returns:
         List of TranscriptSegment objects with word-level timestamps
@@ -69,6 +73,14 @@ def transcribe_audio(
     if model_name not in {"tiny", "base", "small"}:
         model_name = "base"
 
+    # Check for cancellation
+    if cancel_callback and cancel_callback():
+        return []
+
+    # Update status: downloading/loading model
+    if model_status_callback:
+        model_status_callback("Downloading AI model...")
+
     # Load Whisper model (downloads if not cached)
     model = WhisperModel(
         model_name,
@@ -76,6 +88,14 @@ def transcribe_audio(
         compute_type="int8",  # Quantized for speed and memory
         download_root=model_dir,
     )
+
+    # Check for cancellation after model load
+    if cancel_callback and cancel_callback():
+        return []
+
+    # Update status: ready to transcribe
+    if model_status_callback:
+        model_status_callback("Model ready - Transcribing...")
 
     # Transcribe with word-level timestamps
     segments, _ = model.transcribe(
@@ -88,6 +108,10 @@ def transcribe_audio(
     transcript: List[TranscriptSegment] = []
 
     for segment in segments:
+        # Check for cancellation
+        if cancel_callback and cancel_callback():
+            return []
+
         text = (segment.text or "").strip()
         if not text:
             continue
@@ -119,5 +143,9 @@ def transcribe_audio(
                 words=words,
             )
         )
+
+    # Update status: transcription complete
+    if model_status_callback:
+        model_status_callback("Transcription complete")
 
     return transcript
